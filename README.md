@@ -101,6 +101,11 @@ The default runtime uses synchronous execution; Ouro uses its original gate.
 Advanced execution and cache features are opt-in; see the guides below for
 supported combinations.
 
+For contributors working on [FlashLoop integration (RFC #156)](https://github.com/InferMatrixLab/vllm-rlt/issues/156),
+an [INT4 KV codec reference](docs/kv_layout_computation.md#7-int4-codec-reference)
+provides packing and cross-loop residual reconstruction. This is a numerical
+reference module; packed KV serving and runtime configuration remain integration work.
+
 ## Model Support
 
 | Checkpoint | Implementation | Documented validation scope | Guide |

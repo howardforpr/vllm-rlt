@@ -38,7 +38,7 @@ vllm-rlt-pd-serve = "vllm_rlt.entrypoints.pd_serve:main"
 include = ["vllm_rlt*"]
 
 [tool.setuptools]
-license-files = ["LICENSE", "NOTICE"]
+license-files = ["LICENSE", "NOTICE", "LICENSES/FlashLoop-MIT.txt"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

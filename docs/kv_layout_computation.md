@@ -1,6 +1,6 @@
 # SHARED and LAST_EXITED KV: Semantics and Worked Examples
 
-This note explains the `shared` and `last_exited` KV layouts in vllm-rlt and illustrates their attention computations with a numerical example. It describes the implementation reviewed on 2026-09-20.
+This note explains the `shared` and `last_exited` KV layouts in vllm-rlt and illustrates their attention computations with a numerical example. Sections 1–6 describe the implementation reviewed on 2026-09-20. Section 7 documents the INT4 codec reference for RFC #156.
 
 ## 1. Semantic distinction
 
@@ -304,3 +304,76 @@ shared:      ceil(T/B) physical blocks
 The cache pool is preallocated using `num_blocks`. With the same `num_blocks`, both layouts allocate the same KV tensor bytes; `shared` allows that pool to cover more token positions. Early exit under `last_exited` does not automatically release deeper storage because those positions retain the copied history.
 
 `shared` reduces block demand and eliminates finalization copies, but sequential prefill positions within a request can limit performance. The layout alone does not establish which implementation is faster. Because historical attention inputs differ, the layouts are not interchangeable as a lossless memory optimization, and this example does not establish an accuracy ranking.
+
+## 7. INT4 codec reference
+
+[`kernels/kv_quantization.py`](../vllm_rlt/kernels/kv_quantization.py) implements
+the codec/reference submodule of [RFC #156](https://github.com/InferMatrixLab/vllm-rlt/issues/156).
+It accepts one request/layer's logical `[token, KV head, channel]` tensor, the
+layout returned by `KVCacheManager.read()`. It has no page allocator, runtime
+feature switch, attention reader, or stream/lifetime management. Its eager
+validation reads tensor contents and may synchronize CUDA; it is not graph-safe.
+
+```python
+import torch
+
+from vllm_rlt.kernels.kv_quantization import encode_residual, pack_kv
+
+k1 = torch.randn(128, 2, 64, dtype=torch.bfloat16)
+base = pack_kv(k1, kind="key", group_size=64)
+previous = base.decode()
+positions = torch.tensor([1, 9, 65], dtype=torch.int32)
+k2_active = k1[positions.long()] + 0.125
+residual = encode_residual(k2_active, previous, kind="key", positions=positions)
+current = residual.reconstruct(previous)
+stored_bytes = base.storage_bytes + residual.storage_bytes
+```
+
+Use `kind="value"` for V. For group size G and shape `[T,H,D]`, the format is:
+
+| Tensor | K shape | V shape | dtype |
+| --- | --- | --- | --- |
+| payload | `[T,H,ceil(D/2)]` | `[T,H,ceil(D/2)]` | uint8 |
+| minimum, scale (each) | `[ceil(T/G),H,D]` | `[T,H,ceil(D/G)]` | float16 |
+
+The even channel occupies the low nibble, the odd channel the high nibble;
+an odd last channel leaves the high nibble zero. Group parameters and codes
+are calculated in FP32 using affine min/max quantization and ties-to-even
+rounding. Parameters are then stored as FP16. Decode multiplies/adds with the
+stored parameters in FP32 and casts to the original FP32, FP16, or BF16 dtype.
+Constant groups use scale one and code zero. FP16 parameter rounding, including
+scale underflow to zero, contributes to error. Nonfinite inputs, parameter
+overflow and nonfinite decoded/reconstructed outputs raise `ValueError`.
+
+`encode_residual` subtracts the **reconstructed** predecessor, then encodes the
+result. Residual subtraction and each reconstruction addition use the original
+compute dtype, preserving the pinned upstream's per-loop BF16/FP16 rounding.
+The caller must pass the predecessor for that request, layer and depth; the
+codec validates shape, dtype and device, but does not track execution identity.
+
+With `positions=None`, current and predecessor are full tensors of equal shape.
+With an explicit map, current contains only the corresponding active rows while
+the predecessor remains full length. Maps are sorted, unique, same-device int32
+or int64 tensors; the encoded residual owns a copy. Reconstruction returns a
+new tensor and leaves absent positions unchanged. An empty map encodes complete
+inheritance without payload. A zero INT4 code can decode to a nonzero minimum,
+so it cannot represent an absent residual.
+
+K groups follow **compact stored row order**, matching the actual residual
+encoding path in FlashLoop `cache.py` at `aeaadee`; positions control scatter,
+not grouping. The separate upstream `pack_k_per_channel_grouped` helper supports
+another policy based on explicit logical groups. This reference uses compact
+groups only. Callers must keep encoding regions stable: splitting the same rows
+into different calls can change quantization parameters and results.
+
+`storage_bytes` counts payload, minimum/scale, nibble padding, and any residual
+position map. It excludes Python objects, allocator reservations and temporary
+reconstruction tensors. It does not establish serving peak-memory savings or
+model-quality preservation. Packed attention readers and integration with
+allocation, tail policies, prefix reuse, PD, speculation and recovery remain
+work for the shared KV quantization feature PR.
+
+Tests in `tests/test_kv_quantization.py` cover independent expected codes,
+grouping, FP16 parameter precision, residual chains and storage accounting.
+Run CPU cases with `python -m pytest tests/test_kv_quantization.py -q`. CUDA
+cases require the repository's GPU reservation and `--run-gpu` workflow.
